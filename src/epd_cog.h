@@ -14,8 +14,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* Framebuffer size for the 2.06" screen: 248 × 256 / 8 = 7936 bytes. */
-#define EPD_FRAME_SIZE  7936U
+/* Framebuffer size for the 2.06" screen: 248 × 128 / 8 = 3968 bytes. */
+#define EPD_FRAME_SIZE  3968U
 
 #define EPD_UPDATE_NORMAL  1
 #define EPD_UPDATE_FAST    2

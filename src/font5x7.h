@@ -17,6 +17,7 @@
 #define FONT_IDX_DEGREE  4
 #define FONT_IDX_C       5
 #define FONT_IDX_H       6
+#define FONT_IDX_V       7
 #define FONT_IDX_0      10
 #define FONT_IDX_1      11
 #define FONT_IDX_2      12
@@ -37,7 +38,7 @@ static const uint8_t font5x7[20][FONT5X7_WIDTH] = {
     /* 4 °     */   {0x06, 0x09, 0x09, 0x06, 0x00},
     /* 5 C     */   {0x3E, 0x41, 0x41, 0x41, 0x22},
     /* 6 H     */   {0x7F, 0x08, 0x08, 0x08, 0x7F},
-    /* 7 (unused)*/ {0x00, 0x00, 0x00, 0x00, 0x00},
+    /* 7 V     */   {0x07, 0x18, 0x60, 0x18, 0x07},
     /* 8 (unused)*/ {0x00, 0x00, 0x00, 0x00, 0x00},
     /* 9 (unused)*/ {0x00, 0x00, 0x00, 0x00, 0x00},
     /* 10 0    */   {0x3E, 0x51, 0x49, 0x45, 0x3E},
@@ -65,6 +66,7 @@ static inline int font_idx(char c)
     case 0xB0: return FONT_IDX_DEGREE;
     case 'C': return FONT_IDX_C;
     case 'H': return FONT_IDX_H;
+    case 'V': return FONT_IDX_V;
     default:  return FONT_IDX_SPACE;
     }
 }
@@ -94,9 +96,9 @@ static inline void font_draw_char(uint8_t *fb, int fb_width,
                     int byte_idx = (py * fb_width + px) / 8;
                     int bit_idx  = 7 - ((py * fb_width + px) % 8);
                     if (black)
-                        fb[byte_idx] |=  (1 << bit_idx);
-                    else
                         fb[byte_idx] &= ~(1 << bit_idx);
+                    else
+                        fb[byte_idx] |=  (1 << bit_idx);
                 }
             }
         }

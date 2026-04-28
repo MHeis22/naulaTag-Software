@@ -20,4 +20,4 @@ OPT3005 (needs pullup on the interrupt pin), 0x44
 
 Use internal I2C pullup resistors.
 
-E2206KS0E1 SPI e-ink display (drivers in \external but in C++)
+E2206KS0E1 SPI e-ink display (drivers in \external but in C++) (248x128)

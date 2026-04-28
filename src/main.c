@@ -22,6 +22,7 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/sensor.h>
+#include <zephyr/drivers/adc.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/hci.h>
 #include <zephyr/logging/log.h>
@@ -63,10 +64,22 @@ static struct k_timer ble_off_timer;
 /* ── State ─────────────────────────────────────────────────────────────── */
 static bool ble_adv_active = false;
 
+/* ── ADC (battery voltage via internal VDD channel) ───────────────────── */
+static const struct adc_dt_spec adc_vdd =
+    ADC_DT_SPEC_GET(DT_PATH(zephyr_user));
+
 /* ── Measurement state ─────────────────────────────────────────────────── */
 static int32_t  last_temp_mdeg  = 0;
 static uint32_t last_humid_mpct = 0;
 static uint32_t last_lux        = 0;   /* integer lux */
+static uint32_t last_voltage_mv = 0;
+
+/* ── 24-hour temperature history (circular buffer) ─────────────────────── */
+#define HISTORY_SIZE  DISPLAY_HIST_SIZE   /* 144 × 10 min = 24 h */
+
+static int32_t  temp_hist[HISTORY_SIZE];
+static uint16_t hist_head  = 0;   /* next write position    */
+static uint16_t hist_count = 0;   /* valid entries, 0..144  */
 
 /* ── BLE manufacturer data ─────────────────────────────────────────────── */
 /*
@@ -179,31 +192,55 @@ static void do_measure(struct k_work *w)
         last_lux = (uint32_t)lux_val.val1;
     }
 
-    LOG_INF("T=%d.%03d°C  RH=%d.%03d%%  L=%u lux",
+    /* 3. Read battery voltage via internal SAADC VDD channel.
+     *    Gain=1/6, ref=600 mV → full-scale 3600 mV, 12-bit resolution. */
+    {
+        int16_t adc_raw = 0;
+        struct adc_sequence adc_seq = {
+            .buffer      = &adc_raw,
+            .buffer_size = sizeof(adc_raw),
+        };
+        adc_sequence_init_dt(&adc_vdd, &adc_seq);
+        rc = adc_read(adc_vdd.dev, &adc_seq);
+        if (rc == 0 && adc_raw >= 0) {
+            last_voltage_mv = (uint32_t)((int32_t)adc_raw * 3600 / 4096);
+        } else {
+            LOG_WRN("ADC read failed: %d", rc);
+        }
+    }
+
+    /* 4. Store temperature in the circular history buffer */
+    temp_hist[hist_head] = last_temp_mdeg;
+    hist_head = (hist_head + 1) % HISTORY_SIZE;
+    if (hist_count < HISTORY_SIZE) {
+        hist_count++;
+    }
+
+    LOG_INF("T=%d.%03d°C  RH=%d.%03d%%  L=%u lux  VDD=%u mV",
             temp.val1,  temp.val2  / 1000,
             humid.val1, humid.val2 / 1000,
-            last_lux);
+            last_lux, last_voltage_mv);
 
-    /* 3. Update BLE payload; push to stack if advertising is active */
+    /* 5. Update BLE payload; push to stack if advertising is active */
     refresh_mfr_data();
     if (ble_adv_active) {
         bt_le_adv_update_data(ad, ARRAY_SIZE(ad), NULL, 0);
     }
 
-    /* 4. Re-arm OPT3005 threshold interrupt for the current light state */
+    /* 6. Re-arm OPT3005 threshold interrupt for the current light state */
     arm_opt3005_trigger(last_lux);
 
-    /* 5. Night mode: skip display entirely if too dark to see */
+    /* 7. Night mode: skip display entirely if too dark to see */
     if (last_lux < DARK_THRESHOLD_LUX) {
         LOG_INF("Dark — display update skipped");
         return;
     }
 
-    /* 6. Power on display */
+    /* 8. Power on display */
     gpio_pin_set_dt(&load_sw, 1);
     k_sleep(K_MSEC(10));
 
-    /* 7. Update display (init on first call) */
+    /* 9. Update display (init on first call) */
     static bool display_initialized = false;
     if (!display_initialized) {
         rc = display_init();
@@ -212,10 +249,12 @@ static void do_measure(struct k_work *w)
     }
 
     if (display_initialized) {
-        display_update(last_temp_mdeg, last_humid_mpct);
+        display_update(last_temp_mdeg, last_humid_mpct,
+                       last_voltage_mv,
+                       temp_hist, hist_count, hist_head);
     }
 
-    /* 8. Power off display */
+    /* 10. Power off display */
     gpio_pin_set_dt(&load_sw, 0);
 }
 
@@ -339,6 +378,14 @@ int main(void)
     /* Initialise Bluetooth stack (radio stays off until advertising starts) */
     int rc = bt_enable(NULL);
     if (rc) LOG_ERR("bt_enable failed: %d", rc);
+
+    /* Initialise ADC channel for battery voltage measurement */
+    if (!adc_is_ready_dt(&adc_vdd)) {
+        LOG_WRN("ADC not ready — voltage readings disabled");
+    } else {
+        rc = adc_channel_setup_dt(&adc_vdd);
+        if (rc) LOG_ERR("ADC channel setup failed: %d", rc);
+    }
 
     /* Arm OPT3005 light-threshold interrupt (assume dark at boot) */
     if (device_is_ready(opt)) {

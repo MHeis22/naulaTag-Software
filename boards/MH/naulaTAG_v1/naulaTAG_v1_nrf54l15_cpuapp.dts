@@ -24,6 +24,11 @@
 		epd-cs      = &epd_cs;
 	};
 
+	/* Consumer node: lets ADC_DT_SPEC_GET resolve channel@0 config from DTS */
+	zephyr,user {
+		io-channels = <&adc 0>;
+	};
+
 	buttons {
 		compatible = "gpio-keys";
 		/* SRButton: P0.01, active-low with internal pull-up */
@@ -140,10 +145,11 @@
     pinctrl-names = "default", "sleep";
     zephyr,pm-device-runtime-auto;
 
+	/* 
     epd: e2206ks0e1@0 {
         compatible = "mh,e2206ks0e1";
         reg = <0>;
-        /* Cap at 16 MHz to respect the display's limits */
+        // Cap at 16 MHz to respect the display's limits
         spi-max-frequency = <16000000>;
         
         busy-gpios = <&gpio1 3 GPIO_ACTIVE_HIGH>;
@@ -153,6 +159,7 @@
         sck-gpios  = <&gpio2 1 GPIO_ACTIVE_HIGH>;
         mosi-gpios = <&gpio2 2 GPIO_ACTIVE_HIGH>;
     };
+	*/
 };
 
 
@@ -195,4 +202,20 @@
     status = "okay";
     load-capacitors = "internal";
     load-capacitance-femtofarad = <15000>;
+};
+
+/* ── Enable SAADC Measurements ────────────────────────────────────────── */
+&adc {
+    status = "okay";
+    #address-cells = <1>;
+    #size-cells = <0>;
+
+    channel@0 {
+        reg = <0>;
+        zephyr,gain = "ADC_GAIN_1_6";
+        zephyr,reference = "ADC_REF_INTERNAL";
+        zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+        zephyr,input-positive = <NRF_SAADC_VDD>; /* Crucial: points to internal VDD */
+        zephyr,resolution = <12>;
+    };
 };
