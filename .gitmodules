@@ -1,6 +1,0 @@
-[submodule "external/Pervasive_Wide_Small"]
-	path = external/Pervasive_Wide_Small
-	url = https://github.com/PervasiveDisplays/Pervasive_Wide_Small
-[submodule "external/PDLS_Common"]
-	path = external/PDLS_Common
-	url = https://github.com/PervasiveDisplays/PDLS_Common

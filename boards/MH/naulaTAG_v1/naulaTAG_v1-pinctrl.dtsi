@@ -1,0 +1,45 @@
+/*
+ * Copyright (c) 2026 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
+
+#include <dt-bindings/pinctrl/nrf-pinctrl.h>
+
+&pinctrl {
+	/* I2C for HDC3022 (0x45) and OPT3005 (0x44)
+	 * SDA = P1.10, SCL = P1.12 */
+	i2c21_default: i2c21_default {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 1, 10)>,
+				<NRF_PSEL(TWIM_SCL, 1, 12)>;
+			bias-pull-up;
+		};
+	};
+	i2c21_sleep: i2c21_sleep {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 1, 10)>,
+				<NRF_PSEL(TWIM_SCL, 1, 12)>;
+			low-power-enable;
+		};
+	};
+
+	/* SPI for E2206KS0E1 e-ink display
+	 * SCK = P2.01, MOSI = P2.02 (CS and DC are software GPIO) */
+	spi30_default: spi30_default {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 2, 1)>,
+					<NRF_PSEL(SPIM_MOSI, 2, 2)>;
+			/* High drive is critical for speeds > 8 MHz */
+			nordic,drive-mode = <NRF_DRIVE_H0H1>;
+		};
+	};
+
+	spi30_sleep: spi30_sleep {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 2, 1)>,
+					<NRF_PSEL(SPIM_MOSI, 2, 2)>;
+			low-power-enable;
+		};
+	};
+};

@@ -1,268 +1,354 @@
 /*
- * Copyright (c) 2018 Nordic Semiconductor ASA
+ * naulaTAG — IoT temperature/humidity/light meter
  *
- * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ * Hardware: nRF54L15-QFAA-R7
+ *   SRButton  (P0.01) — immediate measurement
+ *   BLEButton (P1.07) — toggle BLE advertising
+ *   HDC3022 (I2C 0x45) — temperature + humidity
+ *   OPT3005 (I2C 0x44) — ambient light, INT on P1.06
+ *   E2206KS0E1 (SPI)   — 2.06" e-ink display
+ *   LoadSwitch (P1.04) — display power rail
+ *
+ * Power strategy:
+ *   CPU sleeps indefinitely (k_sleep(K_FOREVER)).  Zephyr PM enters the
+ *   deepest available idle state.  Wakeup sources: GPIO interrupt (buttons,
+ *   OPT3005 light-threshold crossing), GRTC timer (periodic measurement).
+ *   Display is powered only during screen updates and skipped entirely when
+ *   ambient light is below DARK_THRESHOLD_LUX (e.g. inside a box overnight).
+ *   BLE is off by default; payload carries live sensor readings.
  */
 
-#include <zephyr/types.h>
-#include <stddef.h>
-#include <string.h>
-#include <errno.h>
-#include <zephyr/sys/printk.h>
-#include <zephyr/sys/byteorder.h>
 #include <zephyr/kernel.h>
+#include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
-#include <soc.h>
-
+#include <zephyr/drivers/sensor.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/hci.h>
-#include <zephyr/bluetooth/conn.h>
-#include <zephyr/bluetooth/uuid.h>
-#include <zephyr/bluetooth/gatt.h>
+#include <zephyr/logging/log.h>
+#include <zephyr/pm/device.h>
 
-#include <bluetooth/services/lbs.h>
+#include "display.h"
 
-#include <zephyr/settings/settings.h>
+LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
-#include <dk_buttons_and_leds.h>
+/* ── Measurement interval ─────────────────────────────────────────────── */
+#define MEASURE_INTERVAL_S  600
 
-#define DEVICE_NAME             CONFIG_BT_DEVICE_NAME
-#define DEVICE_NAME_LEN         (sizeof(DEVICE_NAME) - 1)
+/* BLE advertising window after button press (seconds) */
+#define BLE_ADV_TIMEOUT_S   30
 
+/* Ambient light below which display updates are skipped (lux).
+ * 5 lux ≈ deep twilight; anything darker means no one can read the display. */
+#define DARK_THRESHOLD_LUX  5U
 
-#define RUN_STATUS_LED          DK_LED1
-#define CON_STATUS_LED          DK_LED2
-#define RUN_LED_BLINK_INTERVAL  1000
+/* ── Device handles ───────────────────────────────────────────────────── */
+static const struct gpio_dt_spec sr_btn =
+    GPIO_DT_SPEC_GET(DT_ALIAS(sr_button), gpios);
+static const struct gpio_dt_spec ble_btn =
+    GPIO_DT_SPEC_GET(DT_ALIAS(ble_button), gpios);
+static const struct gpio_dt_spec load_sw =
+    GPIO_DT_SPEC_GET(DT_ALIAS(epd_load_sw), gpios);
 
-#define USER_LED                DK_LED3
+static const struct device *hdc = DEVICE_DT_GET(DT_NODELABEL(hdc3022));
+static const struct device *opt = DEVICE_DT_GET(DT_NODELABEL(opt3005));
 
-#define USER_BUTTON             DK_BTN1_MSK
+/* ── Work items ────────────────────────────────────────────────────────── */
+static struct k_work measure_work;
+static struct k_work ble_toggle_work;
 
-static bool app_button_state;
-static struct k_work adv_work;
+/* ── Timers ────────────────────────────────────────────────────────────── */
+static struct k_timer measure_timer;
+static struct k_timer ble_off_timer;
 
-static const struct bt_data ad[] = {
-	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
+/* ── State ─────────────────────────────────────────────────────────────── */
+static bool ble_adv_active = false;
+
+/* ── Measurement state ─────────────────────────────────────────────────── */
+static int32_t  last_temp_mdeg  = 0;
+static uint32_t last_humid_mpct = 0;
+static uint32_t last_lux        = 0;   /* integer lux */
+
+/* ── BLE manufacturer data ─────────────────────────────────────────────── */
+/*
+ * 8-byte payload, all little-endian:
+ *   [0-1]  Company ID  — 0xFFFF (test/undefined; replace with registered ID)
+ *   [2-3]  Temperature — int16_t in units of 0.1 °C
+ *   [4-5]  Humidity    — uint16_t in units of 0.1 %RH
+ *   [6-7]  Light       — uint16_t in lux (capped at 65535)
+ *
+ * A BLE central reading 0xFFFF / company 0xFFFF / T=235 / H=450 / L=120
+ * decodes as: 23.5 °C, 45.0 %RH, 120 lux.
+ */
+#define MFR_DATA_LEN  8
+
+static uint8_t mfr_data[MFR_DATA_LEN];
+
+static void refresh_mfr_data(void)
+{
+    int16_t  t = (int16_t)(last_temp_mdeg  / 100);
+    uint16_t h = (uint16_t)(last_humid_mpct / 100);
+    uint16_t l = (uint16_t)(last_lux > 0xFFFFU ? 0xFFFFU : last_lux);
+
+    mfr_data[0] = 0xFF;
+    mfr_data[1] = 0xFF;
+    mfr_data[2] = (uint8_t)((uint16_t)t);
+    mfr_data[3] = (uint8_t)((uint16_t)t >> 8);
+    mfr_data[4] = (uint8_t)(h);
+    mfr_data[5] = (uint8_t)(h >> 8);
+    mfr_data[6] = (uint8_t)(l);
+    mfr_data[7] = (uint8_t)(l >> 8);
+}
+
+/* ── BLE advertisement data ────────────────────────────────────────────── */
+static struct bt_data ad[] = {
+    BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+    BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME,
+            sizeof(CONFIG_BT_DEVICE_NAME) - 1),
+    BT_DATA(BT_DATA_MANUFACTURER_DATA, mfr_data, MFR_DATA_LEN),
 };
 
-static const struct bt_data sd[] = {
-	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_LBS_VAL),
+/* ── OPT3005 event-driven threshold interrupt ──────────────────────────── */
+/*
+ * After each measurement we re-arm the OPT3005 for the opposite edge:
+ *   dark  → arm high-limit at DARK_THRESHOLD_LUX  (wake when lights turn on)
+ *   bright → arm low-limit  at DARK_THRESHOLD_LUX  (wake when lights turn off)
+ *
+ * This gives instant wakeups on both transitions with no continuous firing.
+ */
+static void opt_trigger_handler(const struct device *dev,
+                                 const struct sensor_trigger *trig)
+{
+    (void)dev; (void)trig;
+    k_work_submit(&measure_work);
+}
+
+static void arm_opt3005_trigger(uint32_t lux)
+{
+    struct sensor_value thresh;
+    const struct sensor_trigger trig = {
+        .type = SENSOR_TRIG_THRESHOLD,
+        .chan = SENSOR_CHAN_LIGHT,
+    };
+
+    if (lux < DARK_THRESHOLD_LUX) {
+        /* Dark: fire when lux exceeds threshold (lights turned on) */
+        thresh.val1 = (int32_t)DARK_THRESHOLD_LUX;
+        thresh.val2 = 0;
+        sensor_attr_set(opt, SENSOR_CHAN_LIGHT, SENSOR_ATTR_UPPER_THRESH, &thresh);
+        thresh.val1 = 0;
+        thresh.val2 = 0;
+        sensor_attr_set(opt, SENSOR_CHAN_LIGHT, SENSOR_ATTR_LOWER_THRESH, &thresh);
+    } else {
+        /* Bright: fire when lux drops below threshold (lights turned off) */
+        thresh.val1 = (int32_t)DARK_THRESHOLD_LUX;
+        thresh.val2 = 0;
+        sensor_attr_set(opt, SENSOR_CHAN_LIGHT, SENSOR_ATTR_LOWER_THRESH, &thresh);
+        thresh.val1 = 100000;  /* beyond any real indoor lux */
+        thresh.val2 = 0;
+        sensor_attr_set(opt, SENSOR_CHAN_LIGHT, SENSOR_ATTR_UPPER_THRESH, &thresh);
+    }
+
+    sensor_trigger_set(opt, &trig, opt_trigger_handler);
+}
+
+/* ── Measurement ──────────────────────────────────────────────────────── */
+static void do_measure(struct k_work *w)
+{
+    (void)w;
+
+    /* 1. Read temperature and humidity */
+    struct sensor_value temp, humid;
+    int rc = sensor_sample_fetch(hdc);
+    if (rc) {
+        LOG_ERR("HDC fetch failed: %d", rc);
+        return;
+    }
+    sensor_channel_get(hdc, SENSOR_CHAN_AMBIENT_TEMP, &temp);
+    sensor_channel_get(hdc, SENSOR_CHAN_HUMIDITY,     &humid);
+
+    last_temp_mdeg  = temp.val1  * 1000 + temp.val2  / 1000;
+    last_humid_mpct = humid.val1 * 1000 + humid.val2 / 1000;
+
+    /* 2. Read ambient light */
+    struct sensor_value lux_val = {0};
+    rc = sensor_sample_fetch(opt);
+    if (rc) {
+        LOG_WRN("OPT fetch failed: %d", rc);
+    } else {
+        sensor_channel_get(opt, SENSOR_CHAN_LIGHT, &lux_val);
+        last_lux = (uint32_t)lux_val.val1;
+    }
+
+    LOG_INF("T=%d.%03d°C  RH=%d.%03d%%  L=%u lux",
+            temp.val1,  temp.val2  / 1000,
+            humid.val1, humid.val2 / 1000,
+            last_lux);
+
+    /* 3. Update BLE payload; push to stack if advertising is active */
+    refresh_mfr_data();
+    if (ble_adv_active) {
+        bt_le_adv_update_data(ad, ARRAY_SIZE(ad), NULL, 0);
+    }
+
+    /* 4. Re-arm OPT3005 threshold interrupt for the current light state */
+    arm_opt3005_trigger(last_lux);
+
+    /* 5. Night mode: skip display entirely if too dark to see */
+    if (last_lux < DARK_THRESHOLD_LUX) {
+        LOG_INF("Dark — display update skipped");
+        return;
+    }
+
+    /* 6. Power on display */
+    gpio_pin_set_dt(&load_sw, 1);
+    k_sleep(K_MSEC(10));
+
+    /* 7. Update display (init on first call) */
+    static bool display_initialized = false;
+    if (!display_initialized) {
+        rc = display_init();
+        if (rc == 0) display_initialized = true;
+        else         LOG_ERR("display init failed: %d", rc);
+    }
+
+    if (display_initialized) {
+        display_update(last_temp_mdeg, last_humid_mpct);
+    }
+
+    /* 8. Power off display */
+    gpio_pin_set_dt(&load_sw, 0);
+}
+
+/* ── BLE toggle ───────────────────────────────────────────────────────── */
+static void do_ble_toggle(struct k_work *w)
+{
+    (void)w;
+
+    if (ble_adv_active) {
+        bt_le_adv_stop();
+        k_timer_stop(&ble_off_timer);
+        ble_adv_active = false;
+        LOG_INF("BLE advertising stopped");
+    } else {
+        /* Stamp current readings into the payload before advertising starts */
+        refresh_mfr_data();
+        int rc = bt_le_adv_start(BT_LE_ADV_CONN_FAST_2,
+                                 ad, ARRAY_SIZE(ad), NULL, 0);
+        if (rc == 0) {
+            ble_adv_active = true;
+            k_timer_start(&ble_off_timer,
+                          K_SECONDS(BLE_ADV_TIMEOUT_S), K_NO_WAIT);
+            LOG_INF("BLE adv started (%d s) — T=%d.%01d°C RH=%d.%01d%% L=%u lux",
+                    BLE_ADV_TIMEOUT_S,
+                    (int)(last_temp_mdeg  / 1000),
+                    (int)((last_temp_mdeg  % 1000) / 100),
+                    (int)(last_humid_mpct / 1000),
+                    (int)((last_humid_mpct % 1000) / 100),
+                    last_lux);
+        } else {
+            LOG_ERR("BLE adv start failed: %d", rc);
+        }
+    }
+}
+
+/* ── Timer callbacks (run in ISR — only submit work) ─────────────────── */
+static void measure_timer_cb(struct k_timer *t)
+{
+    (void)t;
+    k_work_submit(&measure_work);
+}
+
+static void ble_off_timer_cb(struct k_timer *t)
+{
+    (void)t;
+    k_work_submit(&ble_toggle_work);
+}
+
+/* ── GPIO interrupt callbacks ─────────────────────────────────────────── */
+static struct gpio_callback sr_cb_data;
+static struct gpio_callback ble_cb_data;
+
+static void sr_button_isr(const struct device *dev,
+                          struct gpio_callback *cb, uint32_t pins)
+{
+    (void)dev; (void)cb; (void)pins;
+    k_work_submit(&measure_work);
+}
+
+static void ble_button_isr(const struct device *dev,
+                           struct gpio_callback *cb, uint32_t pins)
+{
+    (void)dev; (void)cb; (void)pins;
+    k_work_submit(&ble_toggle_work);
+}
+
+/* ── BLE connection callbacks (informational only) ────────────────────── */
+static void on_connected(struct bt_conn *conn, uint8_t err)
+{
+    if (err) LOG_ERR("BLE connect error %u", err);
+    else     LOG_INF("BLE connected");
+}
+
+static void on_disconnected(struct bt_conn *conn, uint8_t reason)
+{
+    LOG_INF("BLE disconnected (reason %u)", reason);
+    if (ble_adv_active) {
+        bt_le_adv_start(BT_LE_ADV_CONN_FAST_2, ad, ARRAY_SIZE(ad), NULL, 0);
+    }
+}
+
+BT_CONN_CB_DEFINE(conn_cbs) = {
+    .connected    = on_connected,
+    .disconnected = on_disconnected,
 };
 
-static void adv_work_handler(struct k_work *work)
-{
-	int err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_2, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
-
-	if (err) {
-		printk("Advertising failed to start (err %d)\n", err);
-		return;
-	}
-
-	printk("Advertising successfully started\n");
-}
-
-static void advertising_start(void)
-{
-	k_work_submit(&adv_work);
-}
-
-static void connected(struct bt_conn *conn, uint8_t err)
-{
-	if (err) {
-		printk("Connection failed, err 0x%02x %s\n", err, bt_hci_err_to_str(err));
-		return;
-	}
-
-	printk("Connected\n");
-
-	dk_set_led_on(CON_STATUS_LED);
-}
-
-static void disconnected(struct bt_conn *conn, uint8_t reason)
-{
-	printk("Disconnected, reason 0x%02x %s\n", reason, bt_hci_err_to_str(reason));
-
-	dk_set_led_off(CON_STATUS_LED);
-}
-
-static void recycled_cb(void)
-{
-	printk("Connection object available from previous conn. Disconnect is complete!\n");
-	advertising_start();
-}
-
-#ifdef CONFIG_BT_LBS_SECURITY_ENABLED
-static void security_changed(struct bt_conn *conn, bt_security_t level,
-			     enum bt_security_err err)
-{
-	char addr[BT_ADDR_LE_STR_LEN];
-
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
-	if (!err) {
-		printk("Security changed: %s level %u\n", addr, level);
-	} else {
-		printk("Security failed: %s level %u err %d %s\n", addr, level, err,
-		       bt_security_err_to_str(err));
-	}
-}
-#endif
-
-BT_CONN_CB_DEFINE(conn_callbacks) = {
-	.connected        = connected,
-	.disconnected     = disconnected,
-	.recycled         = recycled_cb,
-#ifdef CONFIG_BT_LBS_SECURITY_ENABLED
-	.security_changed = security_changed,
-#endif
-};
-
-#if defined(CONFIG_BT_LBS_SECURITY_ENABLED)
-static void auth_passkey_display(struct bt_conn *conn, unsigned int passkey)
-{
-	char addr[BT_ADDR_LE_STR_LEN];
-
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
-	printk("Passkey for %s: %06u\n", addr, passkey);
-}
-
-static void auth_cancel(struct bt_conn *conn)
-{
-	char addr[BT_ADDR_LE_STR_LEN];
-
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
-	printk("Pairing cancelled: %s\n", addr);
-}
-
-static void pairing_complete(struct bt_conn *conn, bool bonded)
-{
-	char addr[BT_ADDR_LE_STR_LEN];
-
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
-	printk("Pairing completed: %s, bonded: %d\n", addr, bonded);
-}
-
-static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
-{
-	char addr[BT_ADDR_LE_STR_LEN];
-
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
-	printk("Pairing failed conn: %s, reason %d %s\n", addr, reason,
-	       bt_security_err_to_str(reason));
-}
-
-static struct bt_conn_auth_cb conn_auth_callbacks = {
-	.passkey_display = auth_passkey_display,
-	.cancel = auth_cancel,
-};
-
-static struct bt_conn_auth_info_cb conn_auth_info_callbacks = {
-	.pairing_complete = pairing_complete,
-	.pairing_failed = pairing_failed
-};
-#else
-static struct bt_conn_auth_cb conn_auth_callbacks;
-static struct bt_conn_auth_info_cb conn_auth_info_callbacks;
-#endif
-
-static void app_led_cb(bool led_state)
-{
-	dk_set_led(USER_LED, led_state);
-}
-
-static bool app_button_cb(void)
-{
-	return app_button_state;
-}
-
-static struct bt_lbs_cb lbs_callbacs = {
-	.led_cb    = app_led_cb,
-	.button_cb = app_button_cb,
-};
-
-static void button_changed(uint32_t button_state, uint32_t has_changed)
-{
-	if (has_changed & USER_BUTTON) {
-		uint32_t user_button_state = button_state & USER_BUTTON;
-
-		bt_lbs_send_button_state(user_button_state);
-		app_button_state = user_button_state ? true : false;
-	}
-}
-
-static int init_button(void)
-{
-	int err;
-
-	err = dk_buttons_init(button_changed);
-	if (err) {
-		printk("Cannot init buttons (err: %d)\n", err);
-	}
-
-	return err;
-}
-
+/* ── Main ─────────────────────────────────────────────────────────────── */
 int main(void)
 {
-	int blink_status = 0;
-	int err;
+    LOG_INF("naulaTAG starting");
 
-	printk("Starting Bluetooth Peripheral LBS sample\n");
+    /* Load switch: output, initially off */
+    gpio_pin_configure_dt(&load_sw, GPIO_OUTPUT_INACTIVE);
 
-	err = dk_leds_init();
-	if (err) {
-		printk("LEDs init failed (err %d)\n", err);
-		return 0;
-	}
+    /* Buttons: input with interrupt on falling edge (active-low) */
+    gpio_pin_configure_dt(&sr_btn,  GPIO_INPUT);
+    gpio_pin_configure_dt(&ble_btn, GPIO_INPUT);
 
-	err = init_button();
-	if (err) {
-		printk("Button init failed (err %d)\n", err);
-		return 0;
-	}
+    gpio_pin_interrupt_configure_dt(&sr_btn,  GPIO_INT_EDGE_FALLING);
+    gpio_pin_interrupt_configure_dt(&ble_btn, GPIO_INT_EDGE_FALLING);
 
-	if (IS_ENABLED(CONFIG_BT_LBS_SECURITY_ENABLED)) {
-		err = bt_conn_auth_cb_register(&conn_auth_callbacks);
-		if (err) {
-			printk("Failed to register authorization callbacks.\n");
-			return 0;
-		}
+    gpio_init_callback(&sr_cb_data,  sr_button_isr,  BIT(sr_btn.pin));
+    gpio_init_callback(&ble_cb_data, ble_button_isr, BIT(ble_btn.pin));
 
-		err = bt_conn_auth_info_cb_register(&conn_auth_info_callbacks);
-		if (err) {
-			printk("Failed to register authorization info callbacks.\n");
-			return 0;
-		}
-	}
+    gpio_add_callback(sr_btn.port,  &sr_cb_data);
+    gpio_add_callback(ble_btn.port, &ble_cb_data);
 
-	err = bt_enable(NULL);
-	if (err) {
-		printk("Bluetooth init failed (err %d)\n", err);
-		return 0;
-	}
+    /* Work items */
+    k_work_init(&measure_work,    do_measure);
+    k_work_init(&ble_toggle_work, do_ble_toggle);
 
-	printk("Bluetooth initialized\n");
+    /* Periodic measurement timer */
+    k_timer_init(&measure_timer, measure_timer_cb, NULL);
+    k_timer_start(&measure_timer,
+                  K_SECONDS(1),                   /* first fire after 1s  */
+                  K_SECONDS(MEASURE_INTERVAL_S));  /* then every interval  */
 
-	if (IS_ENABLED(CONFIG_SETTINGS)) {
-		settings_load();
-	}
+    /* BLE auto-off timer (one-shot, restarted each time BLE is enabled) */
+    k_timer_init(&ble_off_timer, ble_off_timer_cb, NULL);
 
-	err = bt_lbs_init(&lbs_callbacs);
-	if (err) {
-		printk("Failed to init LBS (err:%d)\n", err);
-		return 0;
-	}
+    /* Initialise Bluetooth stack (radio stays off until advertising starts) */
+    int rc = bt_enable(NULL);
+    if (rc) LOG_ERR("bt_enable failed: %d", rc);
 
-	k_work_init(&adv_work, adv_work_handler);
-	advertising_start();
+    /* Arm OPT3005 light-threshold interrupt (assume dark at boot) */
+    if (device_is_ready(opt)) {
+        arm_opt3005_trigger(0);
+    } else {
+        LOG_WRN("OPT3005 not ready — light interrupt disabled");
+    }
 
-	for (;;) {
-		dk_set_led(RUN_STATUS_LED, (++blink_status) % 2);
-		k_sleep(K_MSEC(RUN_LED_BLINK_INTERVAL));
-	}
+    /* Sleep forever — woken by GPIO interrupts or timers.
+     * Zephyr PM will select the deepest idle state the hardware supports. */
+    k_sleep(K_FOREVER);
+    return 0;
 }

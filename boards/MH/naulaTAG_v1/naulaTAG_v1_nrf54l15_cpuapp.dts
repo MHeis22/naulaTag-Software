@@ -1,0 +1,198 @@
+/dts-v1/;
+
+#include <nordic/nrf54l15_cpuapp.dtsi>
+#include <dt-bindings/gpio/gpio.h>
+#include "naulaTAG_v1-pinctrl.dtsi"
+
+/ {
+	model = "An nRF54L15 based IoT meter with an e-ink display.";
+	compatible = "MH,naulaTAG-v1-cpuapp";
+
+	chosen {
+		zephyr,code-partition = &slot0_partition;
+		zephyr,sram = &cpuapp_sram;
+		zephyr,flash = &cpuapp_rram;
+		zephyr,flash-controller = &rram_controller;
+	};
+
+	aliases {
+		sr-button   = &sr_button;
+		ble-button  = &ble_button;
+		epd-load-sw = &epd_load_sw;
+		epd-busy    = &epd_busy;
+		epd-dc      = &epd_dc;
+		epd-cs      = &epd_cs;
+	};
+
+	buttons {
+		compatible = "gpio-keys";
+		/* SRButton: P0.01, active-low with internal pull-up */
+		sr_button: sr_button {
+			gpios = <&gpio0 1 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+			label = "SR Button";
+		};
+		/* BLEButton: P1.07, active-low with internal pull-up */
+		ble_button: ble_button {
+			gpios = <&gpio1 7 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+			label = "BLE Button";
+		};
+	};
+
+	epd_gpios {
+		compatible = "gpio-leds";
+		/* Load switch for display power rail: P1.04, active-high */
+		epd_load_sw: epd_load_sw {
+			gpios = <&gpio1 4 GPIO_ACTIVE_HIGH>;
+			label = "EPD Load Switch";
+		};
+		/* SPI data/command select: P2.00, active-high = data */
+		epd_dc: epd_dc {
+			gpios = <&gpio2 0 GPIO_ACTIVE_HIGH>;
+			label = "EPD DC";
+		};
+		/* SPI chip-select: P2.05, active-low */
+		epd_cs: epd_cs {
+			gpios = <&gpio2 5 GPIO_ACTIVE_LOW>;
+			label = "EPD CS";
+		};
+	};
+
+	epd_inputs {
+		compatible = "gpio-keys";
+		/* BUSY_N: P1.03, active-low (panel busy when LOW) */
+		epd_busy: epd_busy {
+			gpios = <&gpio1 3 GPIO_ACTIVE_LOW>;
+			label = "EPD Busy";
+		};
+	};
+};
+
+&grtc {
+	owned-channels = <0 1 2 3 4 5 6 7 8 9 10 11>;
+	/* Channels 7-11 reserved for Zero Latency IRQs, 3-4 for FLPR */
+	child-owned-channels = <3 4 7 8 9 10 11>;
+	status = "okay";
+};
+
+&cpuapp_sram {
+	status = "okay";
+};
+
+&cpuapp_rram {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		boot_partition: partition@0 {
+			label = "mcuboot";
+			reg = <0x0 DT_SIZE_K(64)>;
+		};
+
+		slot0_partition: partition@10000 {
+			label = "image-0";
+			reg = <0x10000 DT_SIZE_K(664)>;
+		};
+
+		slot1_partition: partition@b6000 {
+			label = "image-1";
+			reg = <0xb6000 DT_SIZE_K(664)>;
+		};
+
+		storage_partition: partition@15c000 {
+			label = "storage";
+			reg = <0x15c000 DT_SIZE_K(36)>;
+		};
+	};
+};
+
+/* ── I2C bus ─────────────────────────────────────────────────────────── */
+&i2c21 {
+	compatible = "nordic,nrf-twim";
+	status = "okay";
+	pinctrl-0 = <&i2c21_default>;
+	pinctrl-1 = <&i2c21_sleep>;
+	pinctrl-names = "default", "sleep";
+	clock-frequency = <I2C_BITRATE_FAST>;
+	zephyr,pm-device-runtime-auto;
+
+	hdc3022: hdc3022@45 {
+		compatible = "ti,hdc302x";
+		reg = <0x45>;
+		int-gpios = <&gpio0 4 GPIO_ACTIVE_LOW>;
+		status = "okay";
+	};
+
+	opt3005: opt3005@44 {
+		compatible = "ti,opt3001";
+		reg = <0x44>;
+		int-gpios = <&gpio1 6 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+		status = "okay";
+	};
+};
+
+/* ── SPI bus (CS and DC controlled by software) ─────────────────────── */
+&spi30 {
+    compatible = "nordic,nrf-spim";
+    status = "okay";
+    pinctrl-0 = <&spi30_default>;
+    pinctrl-1 = <&spi30_sleep>;
+    pinctrl-names = "default", "sleep";
+    zephyr,pm-device-runtime-auto;
+
+    epd: e2206ks0e1@0 {
+        compatible = "mh,e2206ks0e1";
+        reg = <0>;
+        /* Cap at 16 MHz to respect the display's limits */
+        spi-max-frequency = <16000000>;
+        
+        busy-gpios = <&gpio1 3 GPIO_ACTIVE_HIGH>;
+        dc-gpios   = <&gpio2 0 GPIO_ACTIVE_HIGH>;
+        cs-gpios   = <&gpio2 5 GPIO_ACTIVE_LOW>;
+        
+        sck-gpios  = <&gpio2 1 GPIO_ACTIVE_HIGH>;
+        mosi-gpios = <&gpio2 2 GPIO_ACTIVE_HIGH>;
+    };
+};
+
+
+/* ── Enable GPIO Controllers ─────────────────────────────────────────── */
+&gpio0 {
+    status = "okay";
+};
+
+&gpio1 {
+    status = "okay";
+};
+
+&gpio2 {
+    status = "okay";
+};
+
+/* ── Enable GPIOTE (Hardware Interrupts) ─────────────────────────────── */
+&gpiote20 {
+    status = "okay";
+};
+
+&gpiote30 {
+    status = "okay";
+};
+
+/* ── Enable Hardware Oscillators & Clock Controller ──────────────────── */
+&clock {
+    status = "okay";
+};
+
+/* CHECK THE CAPACITANCE VALUES */
+
+&lfxo {
+    status = "okay";
+    load-capacitors = "internal";
+    load-capacitance-femtofarad = <12500>; 
+};
+
+&hfxo {
+    status = "okay";
+    load-capacitors = "internal";
+    load-capacitance-femtofarad = <15000>;
+};

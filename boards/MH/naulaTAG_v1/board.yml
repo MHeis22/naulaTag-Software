@@ -1,0 +1,44 @@
+board:
+  name: naulaTAG_v1
+  full_name: naulaTAG_v1
+  vendor: MH
+  socs:
+  - name: nrf54l15
+    variants:
+    - name: xip
+      cpucluster: cpuflpr
+
+runners:
+  run_once:
+    '--recover':
+      - runners:
+          - nrfjprog
+          - nrfutil
+        run: first
+        groups:
+          - boards:
+              - naulaTAG_v1/nrf54l15/cpuapp
+              - naulaTAG_v1/nrf54l15/cpuflpr
+              - naulaTAG_v1/nrf54l15/cpuflpr/xip
+    '--erase':
+      - runners:
+          - nrfjprog
+          - jlink
+          - nrfutil
+        run: first
+        groups:
+          - boards:
+              - naulaTAG_v1/nrf54l15/cpuapp
+              - naulaTAG_v1/nrf54l15/cpuflpr
+              - naulaTAG_v1/nrf54l15/cpuflpr/xip
+    '--reset':
+      - runners:
+          - nrfjprog
+          - jlink
+          - nrfutil
+        run: last
+        groups:
+          - boards:
+              - naulaTAG_v1/nrf54l15/cpuapp
+              - naulaTAG_v1/nrf54l15/cpuflpr
+              - naulaTAG_v1/nrf54l15/cpuflpr/xip

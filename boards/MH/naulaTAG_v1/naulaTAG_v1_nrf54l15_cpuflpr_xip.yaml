@@ -1,0 +1,10 @@
+identifier: naulaTAG_v1/nrf54l15/cpuflpr/xip
+name: An nRF54L15 based IoT meter with an e-ink display.
+vendor: MH
+arch: riscv
+toolchain:
+  - zephyr
+sysbuild: true
+ram: 96
+flash: 664
+supported: []
