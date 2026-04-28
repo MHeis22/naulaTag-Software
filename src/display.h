@@ -22,7 +22,7 @@ int display_init(void);
  *
  *  temp_mdeg  : temperature in milli-degrees Celsius (e.g. 23500 = 23.5 °C)
  *  humid_mpct : relative humidity in milli-percent  (e.g. 45000 = 45.0 %)
- *  voltage_mv : supply voltage in millivolts         (e.g. 3024  = 3.024 V)
+ *  voltage_mv : supply voltage in millivolts         (e.g. 3024  = 3.02 V)
  *  temp_hist  : circular buffer of past temp_mdeg readings (may be NULL if
  *               hist_count == 0)
  *  hist_count : number of valid entries in temp_hist (0 .. DISPLAY_HIST_SIZE)
@@ -38,6 +38,11 @@ void display_update(int32_t temp_mdeg, uint32_t humid_mpct,
                     uint32_t voltage_mv,
                     const int32_t *temp_hist, uint16_t hist_count,
                     uint16_t hist_head);
+
+/* * Disconnect logic pins to prevent back-power leakage into the EPD.
+ * Call immediately before disabling the load switch.
+ */
+void display_power_off(void);
 
 #ifdef __cplusplus
 }

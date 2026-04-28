@@ -340,3 +340,13 @@ void epd_update_fast(epd_ctx_t *ctx,
     cog_update(ctx);
     cog_stop_dcdc(ctx);
 }
+
+/* Append this to the bottom of your existing epd_cog.c: */
+void epd_sleep(epd_ctx_t *ctx)
+{
+    /* Float the logic pins via HAL to avoid power siphoning */
+    epd_hal_pins_sleep();
+    
+    /* Clear the GPIO configured bit so cog_resume() re-initializes them on next update */
+    ctx->fsm &= ~FSM_GPIO_MASK;
+}

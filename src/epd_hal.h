@@ -36,3 +36,5 @@ uint8_t epd_hal_spi3_read(void);
 
 void    epd_hal_delay_ms(uint32_t ms);
 void    epd_hal_delay_us(uint32_t us);
+
+void    epd_hal_pins_sleep(void);

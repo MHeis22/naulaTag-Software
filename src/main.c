@@ -2,20 +2,20 @@
  * naulaTAG — IoT temperature/humidity/light meter
  *
  * Hardware: nRF54L15-QFAA-R7
- *   SRButton  (P0.01) — immediate measurement
- *   BLEButton (P1.07) — toggle BLE advertising
- *   HDC3022 (I2C 0x45) — temperature + humidity
- *   OPT3005 (I2C 0x44) — ambient light, INT on P1.06
- *   E2206KS0E1 (SPI)   — 2.06" e-ink display
- *   LoadSwitch (P1.04) — display power rail
+ * SRButton  (P0.01) — immediate measurement
+ * BLEButton (P1.07) — toggle BLE advertising
+ * HDC3022 (I2C 0x45) — temperature + humidity
+ * OPT3005 (I2C 0x44) — ambient light, INT on P1.06
+ * E2206KS0E1 (SPI)   — 2.06" e-ink display
+ * LoadSwitch (P1.04) — display power rail
  *
  * Power strategy:
- *   CPU sleeps indefinitely (k_sleep(K_FOREVER)).  Zephyr PM enters the
- *   deepest available idle state.  Wakeup sources: GPIO interrupt (buttons,
- *   OPT3005 light-threshold crossing), GRTC timer (periodic measurement).
- *   Display is powered only during screen updates and skipped entirely when
- *   ambient light is below DARK_THRESHOLD_LUX (e.g. inside a box overnight).
- *   BLE is off by default; payload carries live sensor readings.
+ * CPU sleeps indefinitely (k_sleep(K_FOREVER)).  Zephyr PM enters the
+ * deepest available idle state.  Wakeup sources: GPIO interrupt (buttons,
+ * OPT3005 light-threshold crossing), GRTC timer (periodic measurement).
+ * Display is powered only during screen updates and skipped entirely when
+ * ambient light is below DARK_THRESH_LOWER_LUX.
+ * BLE is off by default; payload carries live sensor readings.
  */
 
 #include <zephyr/kernel.h>
@@ -38,9 +38,10 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 /* BLE advertising window after button press (seconds) */
 #define BLE_ADV_TIMEOUT_S   30
 
-/* Ambient light below which display updates are skipped (lux).
- * 5 lux ≈ deep twilight; anything darker means no one can read the display. */
-#define DARK_THRESHOLD_LUX  5U
+/* Ambient light hysteresis thresholds (lux).
+ * Hysteresis prevents interrupt storms when hovering exactly at the edge. */
+#define DARK_THRESH_LOWER_LUX  3U
+#define DARK_THRESH_UPPER_LUX  7U
 
 /* ── Device handles ───────────────────────────────────────────────────── */
 static const struct gpio_dt_spec sr_btn =
@@ -82,16 +83,6 @@ static uint16_t hist_head  = 0;   /* next write position    */
 static uint16_t hist_count = 0;   /* valid entries, 0..144  */
 
 /* ── BLE manufacturer data ─────────────────────────────────────────────── */
-/*
- * 8-byte payload, all little-endian:
- *   [0-1]  Company ID  — 0xFFFF (test/undefined; replace with registered ID)
- *   [2-3]  Temperature — int16_t in units of 0.1 °C
- *   [4-5]  Humidity    — uint16_t in units of 0.1 %RH
- *   [6-7]  Light       — uint16_t in lux (capped at 65535)
- *
- * A BLE central reading 0xFFFF / company 0xFFFF / T=235 / H=450 / L=120
- * decodes as: 23.5 °C, 45.0 %RH, 120 lux.
- */
 #define MFR_DATA_LEN  8
 
 static uint8_t mfr_data[MFR_DATA_LEN];
@@ -121,13 +112,6 @@ static struct bt_data ad[] = {
 };
 
 /* ── OPT3005 event-driven threshold interrupt ──────────────────────────── */
-/*
- * After each measurement we re-arm the OPT3005 for the opposite edge:
- *   dark  → arm high-limit at DARK_THRESHOLD_LUX  (wake when lights turn on)
- *   bright → arm low-limit  at DARK_THRESHOLD_LUX  (wake when lights turn off)
- *
- * This gives instant wakeups on both transitions with no continuous firing.
- */
 static void opt_trigger_handler(const struct device *dev,
                                  const struct sensor_trigger *trig)
 {
@@ -143,17 +127,18 @@ static void arm_opt3005_trigger(uint32_t lux)
         .chan = SENSOR_CHAN_LIGHT,
     };
 
-    if (lux < DARK_THRESHOLD_LUX) {
-        /* Dark: fire when lux exceeds threshold (lights turned on) */
-        thresh.val1 = (int32_t)DARK_THRESHOLD_LUX;
+    /* Hysteresis: Prevent interrupt storms when light hovers at threshold */
+    if (lux < DARK_THRESH_UPPER_LUX) {
+        /* Currently dark: fire when it gets distinctly brighter */
+        thresh.val1 = (int32_t)DARK_THRESH_UPPER_LUX;
         thresh.val2 = 0;
         sensor_attr_set(opt, SENSOR_CHAN_LIGHT, SENSOR_ATTR_UPPER_THRESH, &thresh);
         thresh.val1 = 0;
         thresh.val2 = 0;
         sensor_attr_set(opt, SENSOR_CHAN_LIGHT, SENSOR_ATTR_LOWER_THRESH, &thresh);
     } else {
-        /* Bright: fire when lux drops below threshold (lights turned off) */
-        thresh.val1 = (int32_t)DARK_THRESHOLD_LUX;
+        /* Currently bright: fire when it gets distinctly darker */
+        thresh.val1 = (int32_t)DARK_THRESH_LOWER_LUX;
         thresh.val2 = 0;
         sensor_attr_set(opt, SENSOR_CHAN_LIGHT, SENSOR_ATTR_LOWER_THRESH, &thresh);
         thresh.val1 = 100000;  /* beyond any real indoor lux */
@@ -169,20 +154,24 @@ static void do_measure(struct k_work *w)
 {
     (void)w;
 
-    /* 1. Read temperature and humidity */
+    /* 1. Resume & Read temperature and humidity */
+    (void)pm_device_action_run(hdc, PM_DEVICE_ACTION_RESUME);
+    
     struct sensor_value temp, humid;
     int rc = sensor_sample_fetch(hdc);
     if (rc) {
         LOG_ERR("HDC fetch failed: %d", rc);
-        return;
+    } else {
+        sensor_channel_get(hdc, SENSOR_CHAN_AMBIENT_TEMP, &temp);
+        sensor_channel_get(hdc, SENSOR_CHAN_HUMIDITY,     &humid);
+        last_temp_mdeg  = temp.val1  * 1000 + temp.val2  / 1000;
+        last_humid_mpct = humid.val1 * 1000 + humid.val2 / 1000;
     }
-    sensor_channel_get(hdc, SENSOR_CHAN_AMBIENT_TEMP, &temp);
-    sensor_channel_get(hdc, SENSOR_CHAN_HUMIDITY,     &humid);
+    
+    /* Suspend explicitly to prevent I2C pullup leakage */
+    (void)pm_device_action_run(hdc, PM_DEVICE_ACTION_SUSPEND);
 
-    last_temp_mdeg  = temp.val1  * 1000 + temp.val2  / 1000;
-    last_humid_mpct = humid.val1 * 1000 + humid.val2 / 1000;
-
-    /* 2. Read ambient light */
+    /* 2. Read ambient light (OPT3005 left active for threshold INTs) */
     struct sensor_value lux_val = {0};
     rc = sensor_sample_fetch(opt);
     if (rc) {
@@ -192,8 +181,8 @@ static void do_measure(struct k_work *w)
         last_lux = (uint32_t)lux_val.val1;
     }
 
-    /* 3. Read battery voltage via internal SAADC VDD channel.
-     *    Gain=1/6, ref=600 mV → full-scale 3600 mV, 12-bit resolution. */
+    /* 3. Resume & Read battery voltage via internal SAADC VDD channel */
+    (void)pm_device_action_run(adc_vdd.dev, PM_DEVICE_ACTION_RESUME);
     {
         int16_t adc_raw = 0;
         struct adc_sequence adc_seq = {
@@ -208,6 +197,8 @@ static void do_measure(struct k_work *w)
             LOG_WRN("ADC read failed: %d", rc);
         }
     }
+    /* Suspend explicitly to stop SAADC from leaking ~1mA */
+    (void)pm_device_action_run(adc_vdd.dev, PM_DEVICE_ACTION_SUSPEND);
 
     /* 4. Store temperature in the circular history buffer */
     temp_hist[hist_head] = last_temp_mdeg;
@@ -217,8 +208,8 @@ static void do_measure(struct k_work *w)
     }
 
     LOG_INF("T=%d.%03d°C  RH=%d.%03d%%  L=%u lux  VDD=%u mV",
-            temp.val1,  temp.val2  / 1000,
-            humid.val1, humid.val2 / 1000,
+            (int)(last_temp_mdeg / 1000), (int)(abs(last_temp_mdeg) % 1000),
+            (int)(last_humid_mpct / 1000), (int)(last_humid_mpct % 1000),
             last_lux, last_voltage_mv);
 
     /* 5. Update BLE payload; push to stack if advertising is active */
@@ -231,7 +222,7 @@ static void do_measure(struct k_work *w)
     arm_opt3005_trigger(last_lux);
 
     /* 7. Night mode: skip display entirely if too dark to see */
-    if (last_lux < DARK_THRESHOLD_LUX) {
+    if (last_lux < DARK_THRESH_LOWER_LUX) {
         LOG_INF("Dark — display update skipped");
         return;
     }
@@ -254,7 +245,9 @@ static void do_measure(struct k_work *w)
                        temp_hist, hist_count, hist_head);
     }
 
-    /* 10. Power off display */
+    /* 10. CRITICAL: Float logic pins before dropping power to avoid backpower leakage */
+    // Test if this actually saves power.
+    display_power_off();
     gpio_pin_set_dt(&load_sw, 0);
 }
 
@@ -269,7 +262,6 @@ static void do_ble_toggle(struct k_work *w)
         ble_adv_active = false;
         LOG_INF("BLE advertising stopped");
     } else {
-        /* Stamp current readings into the payload before advertising starts */
         refresh_mfr_data();
         int rc = bt_le_adv_start(BT_LE_ADV_CONN_FAST_2,
                                  ad, ARRAY_SIZE(ad), NULL, 0);
@@ -277,13 +269,7 @@ static void do_ble_toggle(struct k_work *w)
             ble_adv_active = true;
             k_timer_start(&ble_off_timer,
                           K_SECONDS(BLE_ADV_TIMEOUT_S), K_NO_WAIT);
-            LOG_INF("BLE adv started (%d s) — T=%d.%01d°C RH=%d.%01d%% L=%u lux",
-                    BLE_ADV_TIMEOUT_S,
-                    (int)(last_temp_mdeg  / 1000),
-                    (int)((last_temp_mdeg  % 1000) / 100),
-                    (int)(last_humid_mpct / 1000),
-                    (int)((last_humid_mpct % 1000) / 100),
-                    last_lux);
+            LOG_INF("BLE adv started");
         } else {
             LOG_ERR("BLE adv start failed: %d", rc);
         }
@@ -346,6 +332,10 @@ int main(void)
 {
     LOG_INF("naulaTAG starting");
 
+    /* Suspend non-essential peripherals immediately at boot */
+    if (device_is_ready(hdc)) (void)pm_device_action_run(hdc, PM_DEVICE_ACTION_SUSPEND);
+    if (device_is_ready(adc_vdd.dev)) (void)pm_device_action_run(adc_vdd.dev, PM_DEVICE_ACTION_SUSPEND);
+
     /* Load switch: output, initially off */
     gpio_pin_configure_dt(&load_sw, GPIO_OUTPUT_INACTIVE);
 
@@ -368,34 +358,23 @@ int main(void)
 
     /* Periodic measurement timer */
     k_timer_init(&measure_timer, measure_timer_cb, NULL);
-    k_timer_start(&measure_timer,
-                  K_SECONDS(1),                   /* first fire after 1s  */
-                  K_SECONDS(MEASURE_INTERVAL_S));  /* then every interval  */
+    k_timer_start(&measure_timer, K_SECONDS(1), K_SECONDS(MEASURE_INTERVAL_S));
 
-    /* BLE auto-off timer (one-shot, restarted each time BLE is enabled) */
+    /* BLE auto-off timer */
     k_timer_init(&ble_off_timer, ble_off_timer_cb, NULL);
 
-    /* Initialise Bluetooth stack (radio stays off until advertising starts) */
     int rc = bt_enable(NULL);
     if (rc) LOG_ERR("bt_enable failed: %d", rc);
 
-    /* Initialise ADC channel for battery voltage measurement */
-    if (!adc_is_ready_dt(&adc_vdd)) {
-        LOG_WRN("ADC not ready — voltage readings disabled");
-    } else {
-        rc = adc_channel_setup_dt(&adc_vdd);
-        if (rc) LOG_ERR("ADC channel setup failed: %d", rc);
+    if (adc_is_ready_dt(&adc_vdd)) {
+        adc_channel_setup_dt(&adc_vdd);
     }
 
-    /* Arm OPT3005 light-threshold interrupt (assume dark at boot) */
     if (device_is_ready(opt)) {
         arm_opt3005_trigger(0);
-    } else {
-        LOG_WRN("OPT3005 not ready — light interrupt disabled");
     }
 
-    /* Sleep forever — woken by GPIO interrupts or timers.
-     * Zephyr PM will select the deepest idle state the hardware supports. */
+    /* Sleep forever — woken by GPIO interrupts or timers. */
     k_sleep(K_FOREVER);
     return 0;
 }

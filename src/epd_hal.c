@@ -174,3 +174,16 @@ void epd_hal_delay_us(uint32_t us)
 {
     k_busy_wait(us);
 }
+
+/// @brief  Configure all EPD pins as disconnected to minimize leakage current during sleep.
+void epd_hal_pins_sleep(void)
+{
+    if (!pin_table_ready) {
+        pin_table_init();
+    }
+    
+    /* Disconnect completely (Hi-Z) to prevent current leaking into display */
+    for (int i = 0; i < N_PINS; i++) {
+        gpio_pin_configure(pin_table[i].port, pin_table[i].pin, GPIO_DISCONNECTED);
+    }
+}
