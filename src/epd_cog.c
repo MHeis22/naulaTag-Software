@@ -346,6 +346,8 @@ void epd_sleep(epd_ctx_t *ctx)
 {
     /* Float the logic pins via HAL to avoid power siphoning */
     epd_hal_pins_sleep();
+
+    epd_hal_spi_end(); // Might not be needed?
     
     /* Clear the GPIO configured bit so cog_resume() re-initializes them on next update */
     ctx->fsm &= ~FSM_GPIO_MASK;
