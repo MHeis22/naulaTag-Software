@@ -7,6 +7,7 @@
  *   2 = CS     gpio2 pin 5   output, active-low
  *   3 = SCK    gpio2 pin 1   bit-bang SPI3 clock
  *   4 = MOSI   gpio2 pin 2   bit-bang SPI3 data (bidirectional)
+ *   5 = RESET  gpio0 pin 0   output, active-low (RST_N)
  */
 #pragma once
 
@@ -18,6 +19,7 @@
 #define EPD_PIN_CS      2
 #define EPD_PIN_SCK     3
 #define EPD_PIN_MOSI    4
+#define EPD_PIN_RESET   5
 #define EPD_NOT_CONNECTED 0xFF
 
 void    epd_hal_gpio_output(uint8_t pin);

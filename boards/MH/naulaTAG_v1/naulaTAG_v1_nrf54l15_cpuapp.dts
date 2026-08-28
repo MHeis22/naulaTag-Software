@@ -22,6 +22,7 @@
 		epd-busy    = &epd_busy;
 		epd-dc      = &epd_dc;
 		epd-cs      = &epd_cs;
+		epd-rst     = &epd_rst;
 	};
 
 	/* Consumer node: lets ADC_DT_SPEC_GET resolve channel@0 config from DTS */
@@ -59,6 +60,13 @@
 		epd_cs: epd_cs {
 			gpios = <&gpio2 5 GPIO_ACTIVE_LOW>;
 			label = "EPD CS";
+		};
+		/* Panel reset RST_N: P0.00, active-low.
+		 * Ordinary GPIO on nRF54L15 — unlike nRF52, the reset function is
+		 * not routable to it via UICR or GPIO CTRLSEL. */
+		epd_rst: epd_rst {
+			gpios = <&gpio0 0 GPIO_ACTIVE_LOW>;
+			label = "EPD Reset";
 		};
 	};
 
@@ -118,7 +126,14 @@
 	pinctrl-0 = <&i2c21_default>;
 	pinctrl-1 = <&i2c21_sleep>;
 	pinctrl-names = "default", "sleep";
-	clock-frequency = <I2C_BITRATE_FAST>;
+	/* Standard mode (100 kHz), not Fast mode.  naulaTAG_v1 has no external
+	 * SDA/SCL pull-ups: the bus is held high only by the nRF internal
+	 * pull-ups (~13 kOhm typ).  Into the ~30 pF of bus capacitance that is
+	 * a ~330 ns rise time, which exceeds the 300 ns Fast-mode limit but sits
+	 * well inside the 1000 ns Standard-mode limit.  Two short sensor reads
+	 * every 10 minutes make the extra bus time free.
+	 * Fit 10 kOhm external pull-ups to go back to I2C_BITRATE_FAST. */
+	clock-frequency = <I2C_BITRATE_STANDARD>;
 	zephyr,pm-device-runtime-auto;
 
 	hdc3022: hdc3022@45 {
@@ -163,6 +178,24 @@
 };
 
 
+/* ── Main supply regulator ───────────────────────────────────────────── */
+/*
+ * Enable the internal DC/DC (SMPS).  The board fits L2 = 4.7 uH between
+ * DCC (pin 46) and DECD (pin 45) for exactly this, but vregmain defaults
+ * to status = "disabled" with regulator-initial-mode = LDO, so without
+ * this node the SoC runs off the LDO and draws roughly twice the active
+ * current — straight off a CR2 primary cell.
+ */
+&vregmain {
+    status = "okay";
+    regulator-initial-mode = <NRF5X_REG_MODE_DCDC>;
+};
+
+/* ── Watchdog ─────────────────────────────────────────────────────────── */
+&wdt31 {
+    status = "okay";
+};
+
 /* ── Enable GPIO Controllers ─────────────────────────────────────────── */
 &gpio0 {
     status = "okay";
@@ -190,18 +223,23 @@
     status = "okay";
 };
 
-/* CHECK THE CAPACITANCE VALUES */
+/* Internal load capacitors.  The value programmed here is the CRYSTAL's
+ * rated load capacitance (CL) — the driver derives the internal cap
+ * setting from it.  Over-stating CL loads the crystal too heavily and
+ * pulls the frequency low, which is why these must track the BOM. */
 
+/* Y1 = Abracon ABS06N-32.768KHZ-9-T:  CL = 9 pF, +/-20 ppm */
 &lfxo {
     status = "okay";
     load-capacitors = "internal";
-    load-capacitance-femtofarad = <12500>; 
+    load-capacitance-femtofarad = <9000>;
 };
 
+/* Y2 = Murata XRCGB32M000F1S2AR0:  CL = 8 pF, 32 MHz */
 &hfxo {
     status = "okay";
     load-capacitors = "internal";
-    load-capacitance-femtofarad = <15000>;
+    load-capacitance-femtofarad = <8000>;
 };
 
 /* ── Enable SAADC Measurements ────────────────────────────────────────── */

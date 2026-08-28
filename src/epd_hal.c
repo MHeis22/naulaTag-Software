@@ -17,7 +17,7 @@ struct pin_entry {
     gpio_pin_t           pin;
 };
 
-#define N_PINS 5
+#define N_PINS 6
 static struct pin_entry pin_table[N_PINS];
 static bool pin_table_ready;
 
@@ -26,6 +26,7 @@ static void pin_table_init(void)
     if (pin_table_ready) {
         return;
     }
+    const struct device *g0 = DEVICE_DT_GET(DT_NODELABEL(gpio0));
     const struct device *g1 = DEVICE_DT_GET(DT_NODELABEL(gpio1));
     const struct device *g2 = DEVICE_DT_GET(DT_NODELABEL(gpio2));
 
@@ -34,6 +35,7 @@ static void pin_table_init(void)
     pin_table[2] = (struct pin_entry){g2, 5};  /* CS    */
     pin_table[3] = (struct pin_entry){g2, 1};  /* SCK   */
     pin_table[4] = (struct pin_entry){g2, 2};  /* MOSI  */
+    pin_table[5] = (struct pin_entry){g0, 0};  /* RESET */
 
     pin_table_ready = true;
 }

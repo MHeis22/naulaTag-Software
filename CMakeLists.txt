@@ -13,6 +13,8 @@ target_sources(app PRIVATE
     src/display.c
     src/epd_hal.c
     src/epd_cog.c
+    src/storage.c
+    src/ble.c
 )
 
 # ── Include paths ──────────────────────────────────────────────────────

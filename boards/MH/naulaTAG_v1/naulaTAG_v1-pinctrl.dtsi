@@ -20,6 +20,13 @@
 		group1 {
 			psels = <NRF_PSEL(TWIM_SDA, 1, 10)>,
 				<NRF_PSEL(TWIM_SCL, 1, 12)>;
+			/* Keep the internal pull-ups on while suspended.  pinctrl's
+			 * low-power branch forces dir=input + buffer=disconnect but
+			 * still applies the pull, so the nRF draws nothing and the
+			 * lines are held high rather than floating.  This board has
+			 * no external pull-ups, so without it SDA/SCL float between
+			 * measurements and the sensors' input buffers sit mid-rail. */
+			bias-pull-up;
 			low-power-enable;
 		};
 	};

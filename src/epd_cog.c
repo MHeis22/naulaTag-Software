@@ -12,6 +12,7 @@
 #include "epd_cog.h"
 #include "epd_hal.h"
 
+#include <errno.h>
 #include <string.h>
 
 /* ── Internal constants ─────────────────────────────────────────────────── */
@@ -19,32 +20,46 @@
 #define DELAY_CS_US   50u   /* inter-command CS timing for FAMILY_SMALL */
 #define FSM_GPIO_MASK 0x01u
 
+/*
+ * Upstream's b_waitBusy() polls forever.  That is tolerable on a tethered dev
+ * board and not on an unattended battery device, so the wait is bounded here.
+ * A full refresh at the panel's -15 C limit is seconds, not tens of seconds,
+ * so this only trips when the panel is genuinely not responding.
+ */
+#define BUSY_POLL_MS     32u
+#define BUSY_TIMEOUT_MS  20000u
+
 /* ── Low-level SPI helpers (mirror hV_Board private methods) ────────────── */
 
 /* b_reset(ms1, ms2, ms3, ms4, ms5)
- * panelReset is NOT_CONNECTED on this board so those pin ops are no-ops;
- * only the delays and the final CS-high matter. */
+ * RST_N is active-low, so raw 1 releases reset and raw 0 asserts it — the same
+ * sense as upstream's GPIO_set / GPIO_clear on panelReset. */
 static void cog_hw_reset(epd_ctx_t *ctx,
                          uint32_t ms1, uint32_t ms2, uint32_t ms3,
                          uint32_t ms4, uint32_t ms5)
 {
-    epd_hal_delay_ms(ms1);
-    /* panelReset HIGH — NOT_CONNECTED, no-op */
+    epd_hal_delay_ms(ms1);                      /* wait for power stabilisation */
+    epd_hal_gpio_set(ctx->pin_reset, 1);
     epd_hal_delay_ms(ms2);
-    /* panelReset LOW  — NOT_CONNECTED, no-op */
+    epd_hal_gpio_set(ctx->pin_reset, 0);
     epd_hal_delay_ms(ms3);
-    /* panelReset HIGH — NOT_CONNECTED, no-op */
+    epd_hal_gpio_set(ctx->pin_reset, 1);
     epd_hal_delay_ms(ms4);
     epd_hal_gpio_set(ctx->pin_cs, 1);
     epd_hal_delay_ms(ms5);
 }
 
-/* b_waitBusy(HIGH) — busy clears when BUSY pin goes HIGH */
-static void cog_wait_busy(epd_ctx_t *ctx)
+/* b_waitBusy(HIGH) — busy clears when BUSY pin goes HIGH.
+ * Returns 0 when the panel released BUSY, -ETIMEDOUT if it never did. */
+static int cog_wait_busy(epd_ctx_t *ctx)
 {
-    while (epd_hal_gpio_get(ctx->pin_busy) != 1) {
-        epd_hal_delay_ms(32);
+    for (uint32_t waited = 0; waited < BUSY_TIMEOUT_MS; waited += BUSY_POLL_MS) {
+        if (epd_hal_gpio_get(ctx->pin_busy) == 1) {
+            return 0;
+        }
+        epd_hal_delay_ms(BUSY_POLL_MS);
     }
+    return (epd_hal_gpio_get(ctx->pin_busy) == 1) ? 0 : -ETIMEDOUT;
 }
 
 /* b_sendCommand8 */
@@ -116,6 +131,9 @@ static void cog_resume(epd_ctx_t *ctx)
     epd_hal_gpio_output(ctx->pin_dc);
     epd_hal_gpio_set(ctx->pin_dc, 1);
 
+    epd_hal_gpio_output(ctx->pin_reset);
+    epd_hal_gpio_set(ctx->pin_reset, 1);
+
     epd_hal_gpio_output(ctx->pin_cs);
     epd_hal_gpio_set(ctx->pin_cs, 1);
 
@@ -138,13 +156,15 @@ static void cog_reset(epd_ctx_t *ctx)
  *   Bank 0: marker at offset 0x0000 (0xa5), PSR at 0x0b1b
  *   Bank 1: marker at offset 0x0c00 (0xa5), PSR at 0x171b
  */
-static void cog_read_otp(epd_ctx_t *ctx)
+static int cog_read_otp(epd_ctx_t *ctx)
 {
+    ctx->otp_valid = false;
+
     epd_hal_spi_end();   /* release SCK/MOSI for bit-bang */
 
     /* Application note § 3. Set pins for 3-wire read */
     epd_hal_gpio_set(ctx->pin_dc, 1);
-    /* panelReset HIGH — NOT_CONNECTED, no-op */
+    epd_hal_gpio_set(ctx->pin_reset, 1);
     epd_hal_gpio_set(ctx->pin_cs, 1);
 
     cog_hw_reset(ctx, 0, 5, 5, 10, 20);
@@ -180,12 +200,17 @@ static void cog_read_otp(epd_ctx_t *ctx)
         epd_hal_gpio_set(ctx->pin_cs, 1);
     }
 
-    /* Verify 0xa5 marker at offsetA5 (bank 1 only) */
+    /* Verify 0xa5 marker at offsetA5 (bank 1 only; for bank 0 the marker is
+     * `first`, already checked above by the bank selection itself).
+     * A mismatch means the OTP read is garbage — the PSR bytes would drive the
+     * wrong waveform, so fail out rather than display something unpredictable. */
     if (offset_a5 > 0u) {
         epd_hal_gpio_set(ctx->pin_cs, 0);
         uint8_t marker = epd_hal_spi3_read();
         epd_hal_gpio_set(ctx->pin_cs, 1);
-        (void)marker; /* assertion omitted; trust the panel */
+        if (marker != 0xa5u) {
+            return -EIO;
+        }
     }
 
     /* Skip from offsetA5+1 to offsetPSR */
@@ -203,11 +228,12 @@ static void cog_read_otp(epd_ctx_t *ctx)
     }
 
     ctx->otp_valid = true;
+    return 0;
 }
 
 /* ── COG_initial ────────────────────────────────────────────────────────── */
 
-static void cog_initial(epd_ctx_t *ctx, uint8_t mode)
+static int cog_initial(epd_ctx_t *ctx, uint8_t mode)
 {
     /* Application note § 4. Input initial command */
     uint8_t temp_reg;
@@ -224,7 +250,10 @@ static void cog_initial(epd_ctx_t *ctx, uint8_t mode)
     }
 
     cog_cmd8data8(ctx, 0x00, 0x0e);  /* Soft-reset */
-    cog_wait_busy(ctx);
+    int rc = cog_wait_busy(ctx);
+    if (rc) {
+        return rc;
+    }
 
     cog_cmd8data8(ctx, 0xe5, temp_reg); /* Input Temperature */
     cog_cmd8data8(ctx, 0xe0, 0x02);     /* Activate Temperature */
@@ -233,6 +262,7 @@ static void cog_initial(epd_ctx_t *ctx, uint8_t mode)
     if (mode == EPD_UPDATE_FAST) {
         cog_cmd8data8(ctx, 0x50, 0x07); /* Vcom and data interval */
     }
+    return 0;
 }
 
 /* ── COG_sendImageDataNormal ────────────────────────────────────────────── */
@@ -264,33 +294,43 @@ static void cog_send_fast(epd_ctx_t *ctx,
 
 /* ── COG_update ─────────────────────────────────────────────────────────── */
 
-static void cog_update(epd_ctx_t *ctx)
+static int cog_update(epd_ctx_t *ctx)
 {
     /* Application note § 6. Send updating command */
-    cog_wait_busy(ctx);
+    int rc = cog_wait_busy(ctx);
+    if (rc) {
+        return rc;
+    }
+
     cog_cmd8(ctx, 0x04);  /* Power on */
-    cog_wait_busy(ctx);
+    rc = cog_wait_busy(ctx);
+    if (rc) {
+        return rc;
+    }
+
     cog_cmd8(ctx, 0x12);  /* Display Refresh */
-    cog_wait_busy(ctx);
+    return cog_wait_busy(ctx);
 }
 
 /* ── COG_stopDCDC ───────────────────────────────────────────────────────── */
 
-static void cog_stop_dcdc(epd_ctx_t *ctx)
+static int cog_stop_dcdc(epd_ctx_t *ctx)
 {
     /* Application note § 7. Turn-off DC/DC */
     cog_cmd8(ctx, 0x02);  /* Power off */
-    cog_wait_busy(ctx);
+    return cog_wait_busy(ctx);
 }
 
 /* ── Public API ─────────────────────────────────────────────────────────── */
 
-void epd_begin(epd_ctx_t *ctx,
-               uint8_t pin_busy, uint8_t pin_dc, uint8_t pin_cs)
+int epd_begin(epd_ctx_t *ctx,
+              uint8_t pin_busy, uint8_t pin_dc, uint8_t pin_cs,
+              uint8_t pin_reset)
 {
     ctx->pin_busy    = pin_busy;
     ctx->pin_dc      = pin_dc;
     ctx->pin_cs      = pin_cs;
+    ctx->pin_reset   = pin_reset;
     ctx->temperature = 25;
     ctx->otp_valid   = false;
     ctx->fsm         = 0;
@@ -301,7 +341,7 @@ void epd_begin(epd_ctx_t *ctx,
 
     cog_resume(ctx);
     cog_reset(ctx);
-    cog_read_otp(ctx);   /* ends SPI; leaves it inactive */
+    return cog_read_otp(ctx);   /* ends SPI; leaves it inactive */
 }
 
 void epd_set_temperature(epd_ctx_t *ctx, int8_t celsius)
@@ -309,45 +349,71 @@ void epd_set_temperature(epd_ctx_t *ctx, int8_t celsius)
     ctx->temperature = celsius;
 }
 
-void epd_update_normal(epd_ctx_t *ctx,
-                       const uint8_t *frame, uint32_t size)
+/*
+ * On failure these return early with the DC/DC potentially still on.  That is
+ * deliberate: the caller drops the load switch immediately afterwards, which is
+ * a more reliable way out than issuing further commands to a panel that has
+ * already stopped answering.
+ */
+int epd_update_normal(epd_ctx_t *ctx,
+                      const uint8_t *frame, uint32_t size)
 {
     cog_resume(ctx);
     cog_reset(ctx);
 
     if (!ctx->otp_valid) {
-        cog_read_otp(ctx);  /* re-read if somehow lost */
+        int rc = cog_read_otp(ctx);  /* re-read if somehow lost */
+        if (rc) {
+            return rc;
+        }
         cog_reset(ctx);
     }
 
     epd_hal_spi_begin(16000000);
-    cog_initial(ctx, EPD_UPDATE_NORMAL);
+
+    int rc = cog_initial(ctx, EPD_UPDATE_NORMAL);
+    if (rc) {
+        return rc;
+    }
     cog_send_normal(ctx, frame, size);
-    cog_update(ctx);
-    cog_stop_dcdc(ctx);
+    rc = cog_update(ctx);
+    if (rc) {
+        return rc;
+    }
+    return cog_stop_dcdc(ctx);
 }
 
-void epd_update_fast(epd_ctx_t *ctx,
-                     const uint8_t *prev, const uint8_t *next,
-                     uint32_t size)
+int epd_update_fast(epd_ctx_t *ctx,
+                    const uint8_t *prev, const uint8_t *next,
+                    uint32_t size)
 {
     cog_resume(ctx);
     cog_reset(ctx);
 
     epd_hal_spi_begin(16000000);
-    cog_initial(ctx, EPD_UPDATE_FAST);
+
+    int rc = cog_initial(ctx, EPD_UPDATE_FAST);
+    if (rc) {
+        return rc;
+    }
     cog_send_fast(ctx, prev, next, size);
-    cog_update(ctx);
-    cog_stop_dcdc(ctx);
+    rc = cog_update(ctx);
+    if (rc) {
+        return rc;
+    }
+    return cog_stop_dcdc(ctx);
 }
 
-/* Append this to the bottom of your existing epd_cog.c: */
 void epd_sleep(epd_ctx_t *ctx)
 {
-    /* Float the logic pins via HAL to avoid power siphoning */
-    epd_hal_pins_sleep();
+    /* Release SPI first: suspending the device re-applies the spi30 "sleep"
+     * pinctrl state to SCK/MOSI, which would otherwise land after the GPIO
+     * disconnect below. */
+    epd_hal_spi_end();
 
-    epd_hal_spi_end(); // Might not be needed?
+    /* Float every panel-facing pin so nothing back-feeds the display once the
+     * load switch opens. */
+    epd_hal_pins_sleep();
     
     /* Clear the GPIO configured bit so cog_resume() re-initializes them on next update */
     ctx->fsm &= ~FSM_GPIO_MASK;

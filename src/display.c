@@ -21,6 +21,7 @@
 #include "font5x7.h"
 
 #include <zephyr/kernel.h>
+#include <errno.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -37,6 +38,9 @@
 
 static epd_ctx_t epd_ctx;
 static bool      epd_ready;
+/* Set whenever the panel contents stop being knowable — at startup, and after
+ * any failed update — so the next update repaints the whole screen. */
+static bool      force_full_refresh = true;
 
 static uint8_t fb[FB_SIZE];
 static uint8_t fb_prev[FB_SIZE];
@@ -113,18 +117,22 @@ static void draw_graph(uint8_t *buf, const int32_t *hist, uint16_t count, uint16
 }
 
 int display_init(void) {
-    epd_begin(&epd_ctx, EPD_PIN_BUSY, EPD_PIN_DC, EPD_PIN_CS);
-    epd_ready = true;
+    int rc = epd_begin(&epd_ctx, EPD_PIN_BUSY, EPD_PIN_DC, EPD_PIN_CS,
+                       EPD_PIN_RESET);
+    epd_ready = (rc == 0);
+    if (rc) {
+        return rc;
+    }
     fb_clear(fb_prev, 0xFF);
     return 0;
 }
 
-void display_update(int32_t temp_mdeg, uint32_t humid_mpct,
-                    uint32_t voltage_mv,
-                    const int32_t *temp_hist, uint16_t hist_count,
-                    uint16_t hist_head)
+int display_update(int32_t temp_mdeg, uint32_t humid_mpct,
+                   uint32_t voltage_mv,
+                   const int32_t *temp_hist, uint16_t hist_count,
+                   uint16_t hist_head)
 {
-    if (!epd_ready) return;
+    if (!epd_ready) return -ENODEV;
 
     int8_t t_celsius = (int8_t)(temp_mdeg / 1000);
     epd_set_temperature(&epd_ctx, t_celsius);
@@ -155,16 +163,35 @@ void display_update(int32_t temp_mdeg, uint32_t humid_mpct,
     draw_graph(fb, temp_hist, hist_count, hist_head);
 
     static uint32_t update_count;
-    bool use_fast = (t_celsius >= 0 && t_celsius <= 50) && (update_count % 144 != 0);
+    /* A fast update differentiates against fb_prev, so it is only valid while
+     * the panel really holds that frame.  After a failed update it does not. */
+    bool use_fast = !force_full_refresh &&
+                    (t_celsius >= 0 && t_celsius <= 50) &&
+                    (update_count % 144 != 0);
 
-    if (use_fast) epd_update_fast(&epd_ctx, fb_prev, fb, FB_SIZE);
-    else          epd_update_normal(&epd_ctx, fb, FB_SIZE);
+    int rc;
+    if (use_fast) rc = epd_update_fast(&epd_ctx, fb_prev, fb, FB_SIZE);
+    else          rc = epd_update_normal(&epd_ctx, fb, FB_SIZE);
+
+    force_full_refresh = (rc != 0);
+    if (rc) {
+        return rc;
+    }
 
     update_count++;
+    return 0;
 }
 
 void display_power_off(void) {
+    /* Unconditional: the caller drops the load switch straight after this, and
+     * any pin left driven then back-feeds the unpowered panel through its input
+     * ESD clamps.  epd_begin() configures those pins as outputs before it can
+     * fail, so a failed display_init() — epd_ready == false — is exactly the
+     * case that must still be cleaned up. */
     if (epd_ready) {
         epd_sleep(&epd_ctx);
+    } else {
+        epd_hal_spi_end();
+        epd_hal_pins_sleep();
     }
 }

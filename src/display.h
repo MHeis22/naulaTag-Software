@@ -13,7 +13,9 @@ extern "C" {
 /*
  * Initialise the display driver and read OTP from the panel.
  * Must be called while the load switch is ON (display powered).
- * Returns 0 on success, negative errno on failure.
+ * Returns 0 on success, negative errno on failure — -EIO if the panel did not
+ * return a valid OTP marker, which generally means it is absent or unpowered.
+ * On failure the driver stays disabled; call again on the next cycle to retry.
  */
 int display_init(void);
 
@@ -31,13 +33,17 @@ int display_init(void);
  *
  * The display driver automatically sets the temperature register so the panel
  * waveform matches the ambient temperature for best contrast.
+ *
+ * Returns 0 on success, negative errno on failure — -ETIMEDOUT if the panel
+ * never released BUSY, -ENODEV if display_init() has not succeeded.  A failure
+ * leaves the panel contents undefined; the next call repaints in full.
  */
 #define DISPLAY_HIST_SIZE  144
 
-void display_update(int32_t temp_mdeg, uint32_t humid_mpct,
-                    uint32_t voltage_mv,
-                    const int32_t *temp_hist, uint16_t hist_count,
-                    uint16_t hist_head);
+int display_update(int32_t temp_mdeg, uint32_t humid_mpct,
+                   uint32_t voltage_mv,
+                   const int32_t *temp_hist, uint16_t hist_count,
+                   uint16_t hist_head);
 
 /* * Disconnect logic pins to prevent back-power leakage into the EPD.
  * Call immediately before disabling the load switch.

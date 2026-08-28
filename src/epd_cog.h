@@ -23,23 +23,32 @@ typedef struct {
     uint8_t pin_busy;
     uint8_t pin_dc;
     uint8_t pin_cs;
+    uint8_t pin_reset;
     uint8_t otp[2];      /* PSR0 and PSR1 read from panel OTP */
     bool    otp_valid;
     int8_t  temperature; /* °C — used for waveform calibration */
     uint8_t fsm;         /* bit 0: GPIO pins have been configured */
 } epd_ctx_t;
 
-void epd_begin(epd_ctx_t *ctx,
-               uint8_t pin_busy, uint8_t pin_dc, uint8_t pin_cs);
+/*
+ * All three of these return 0 on success, or a negative errno:
+ *   -ETIMEDOUT  the panel never released BUSY
+ *   -EIO        the OTP read did not return the expected marker
+ * A failed update leaves the panel contents undefined, so the caller must force
+ * a full refresh next time rather than trusting its previous-frame buffer.
+ */
+int epd_begin(epd_ctx_t *ctx,
+              uint8_t pin_busy, uint8_t pin_dc, uint8_t pin_cs,
+              uint8_t pin_reset);
 
 void epd_set_temperature(epd_ctx_t *ctx, int8_t celsius);
 
-void epd_update_normal(epd_ctx_t *ctx,
-                       const uint8_t *frame, uint32_t size);
+int epd_update_normal(epd_ctx_t *ctx,
+                      const uint8_t *frame, uint32_t size);
 
-void epd_update_fast(epd_ctx_t *ctx,
-                     const uint8_t *prev, const uint8_t *next,
-                     uint32_t size);
+int epd_update_fast(epd_ctx_t *ctx,
+                    const uint8_t *prev, const uint8_t *next,
+                    uint32_t size);
 
 /* Places pins into disconnected state and prepares context for next power-on */
 void epd_sleep(epd_ctx_t *ctx);
